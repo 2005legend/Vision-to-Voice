@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Large third-party submodules / datasets — not part of our project
+PaddleOCR/
+LaTeX-OCR/
+CROHME DATASET/
+
+# Archives
+archive.zip
+*.zip
+
+# Logs & runtime output
+*.log
+board_reader.log
+
+# Personal / session data
+student_profile.json
+
+# Model weights
+*.pt
+*.bin
+*.onnx
+
+# Hypothesis test database
+.hypothesis/
+
+# Pytest cache
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Streamlit
+.streamlit/
+
+# Kiro IDE spec/config
+.kiro/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
