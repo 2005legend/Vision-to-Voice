@@ -84,23 +84,30 @@ def build_gemini_prompt(
 
     # Default: math mode
     return (
-        f"You are a kind, thorough math teacher explaining to a visually impaired {grade_level}th-grade student.\n"
-        "The student cannot see the board — your spoken explanation is their only source of information.\n"
-        "Do NOT use visual references such as \"as shown above\", \"see the diagram\", \"look at\", or \"as you can see\".\n"
+        f"You are a clear, confident math teacher explaining to a visually impaired {grade_level}th-grade student.\n"
+        "The student cannot see the board — your spoken explanation is their ONLY source of information.\n"
+        "Do NOT use visual references such as \"as shown\", \"see above\", \"look at\", or \"as you can see\".\n"
         f"{detail_line}"
+        "\n"
+        "IMPORTANT — OCR WARNING: The board steps below were extracted by OCR and may have "
+        "formatting errors, missing parentheses, or ambiguous notation. "
+        "Use your mathematical knowledge to interpret the INTENT of each step correctly. "
+        "Do NOT get confused by OCR artifacts — reason through what the step must mean mathematically.\n"
         "\n"
         f"Topic: {board_state.topic}\n"
         "\n"
-        f"Board steps:\n{steps_text}\n"
+        f"Board steps (may have OCR formatting errors):\n{steps_text}\n"
         "\n"
         f"Equations:\n{equations_text}\n"
         "\n"
         "Instructions:\n"
-        f"- Explain the full solution clearly and step by step in spoken language suitable for a {grade_level}th-grade student.\n"
-        "- For each step, explain WHAT is being done and WHY.\n"
-        "- Read out all equations in plain spoken words (e.g. 'x equals negative four plus or minus the square root of sixteen minus sixteen, all divided by two').\n"
-        "- Be thorough — do not skip steps. The student is relying entirely on your explanation.\n"
-        "- Do not introduce methods not shown on the board."
+        f"- Give a clear, confident explanation in spoken language for a {grade_level}th-grade student.\n"
+        "- Work through each step in order. For each step explain WHAT is done and WHY.\n"
+        "- Read equations in plain spoken words.\n"
+        "- If steps appear contradictory due to OCR errors, use the LAST step as the correct answer "
+        "and explain the logical path to reach it.\n"
+        "- Be concise — maximum 200 words. Do not repeat yourself or second-guess your answer.\n"
+        "- End with the final answer stated clearly."
     )
 
 
@@ -140,10 +147,20 @@ def _call_groq(prompt: str, config: Config) -> str | None:
         try:
             completion = client.chat.completions.create(
                 model=config.groq_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a math teacher giving a spoken explanation to a blind student. "
+                            "Be confident and concise. Never second-guess yourself mid-explanation. "
+                            "State the answer clearly at the end. Maximum 200 words."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
                 top_p=0.9,
-                max_tokens=2048,
+                max_tokens=600,
                 stream=True,
             )
             parts = [c.choices[0].delta.content for c in completion
