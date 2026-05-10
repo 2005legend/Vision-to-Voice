@@ -107,6 +107,27 @@ def get_stt():
     return engine
 
 
+@st.cache_resource
+def get_cam_state():
+    return {
+        "cam_running":            False,
+        "live_mode_active":       False,
+        "latest_frame":           None,
+        "ai_running":             False,
+        "last_explanation":       "",
+        "last_spoken_explanation": "",
+        "voice_trigger":          False,
+        "ask_question_trigger":   False,
+        "manual_capture_trigger": False,
+        "camera_on_trigger":      False,
+        "barge_in_enabled":       True,
+        "voice_active":           False,
+        "board_state":            None,
+        "processed_frames":       0,
+        "frame_timestamp":        0.0
+    }
+
+
 def get_profile():
     """Load or initialise the StudentProfile for this session."""
     if "student_profile" not in st.session_state:
@@ -756,24 +777,6 @@ with tab_upload:
 # ── Tab 2: Camera ─────────────────────────────────────────────────────────────
 with tab_camera:
     st.subheader("Live camera capture")
-
-    @st.cache_resource
-    def get_cam_state():
-        return {
-            "cam_running":            False,
-            "live_mode_active":       False,
-            "latest_frame":           None,
-            "ai_running":             False,
-            "last_explanation":       "",
-            "voice_trigger":          False,
-            "ask_question_trigger":   False,
-            "manual_capture_trigger": False,
-            "camera_on_trigger":      False,
-            "voice_active":           False,
-            "board_state":            None,
-            "processed_frames":       0,
-            "frame_timestamp":        0.0
-        }
 
     cam_state = get_cam_state()
     from board_reader.capture import compute_frame_diff
