@@ -6,6 +6,9 @@ import traceback
 
 # Skip PaddleOCR/PaddleX connectivity check — avoids 10s delay on startup
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+# Suppress OpenCV MSMF verbose frame-grab warnings on Windows
+os.environ.setdefault("OPENCV_VIDEOIO_DEBUG", "0")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 import cv2
 import numpy as np
@@ -153,7 +156,9 @@ def _handle_voice_interaction(board_state, profile, mode="math"):
     stt = get_stt()
     tts = get_tts()
     cfg = get_config()
-    is_headphones = st.session_state.get("barge_in_enabled", True)
+    # Read barge_in from cam_state (thread-safe) not st.session_state
+    cam_state = get_cam_state()
+    is_headphones = cam_state.get("barge_in_enabled", True)
 
     if not is_headphones:
         # Wait for TTS to drain, then listen once
@@ -240,7 +245,7 @@ def _dispatch_voice_command(text: str, board_state, profile, mode: str = "math")
     # ── Repeat ────────────────────────────────────────
     if any(w in t for w in ["repeat", "say again", "again", "replay", "once more"]):
         record_event(profile, "repeat")
-        last = st.session_state.get("last_spoken_explanation", "")
+        last = get_cam_state().get("last_spoken_explanation", "")
         if last:
             speak(last)
             _handle_voice_interaction(board_state, profile, mode)
@@ -290,8 +295,8 @@ def _dispatch_voice_command(text: str, board_state, profile, mode: str = "math")
     answer = handle_doubt(text, board_state, cfg, profile)
     adapt_profile(profile)
     save_profile(profile)
-    # Store for potential repeat
-    st.session_state["last_spoken_explanation"] = answer
+    # Store for potential repeat — use cam_state (thread-safe)
+    get_cam_state()["last_spoken_explanation"] = answer
     speak(answer)
     # Keep listening after answering
     _handle_voice_interaction(board_state, profile, mode)
@@ -471,6 +476,8 @@ with st.sidebar:
         help="Mandatory voice control is active. If using Speakers, wait for the explanation to finish before asking a question."
     )
     st.session_state["barge_in_enabled"] = barge_in_mode.startswith("Headphones")
+    # Also write to cam_state so background threads can read it safely
+    get_cam_state()["barge_in_enabled"] = st.session_state["barge_in_enabled"]
     st.divider()
 
     # ── TTS diagnostic ────────────────────────────────────────────────────────
@@ -771,26 +778,58 @@ with tab_camera:
     cam_state = get_cam_state()
     from board_reader.capture import compute_frame_diff
 
+    # Register shutdown hook — stops threads cleanly when Streamlit exits
+    import atexit
+    def _shutdown():
+        cam_state["cam_running"] = False
+        cam_state["live_mode_active"] = False
+    atexit.register(_shutdown)
+
     # ── Thread 1: Pure capture ───────────────────────
     def _capture_thread(cam_state: dict, camera_index: int):
         import time
-        cap = cv2.VideoCapture(camera_index)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # minimize iVCam internal buffer
+        import os
+
+        # Suppress OpenCV MSMF verbose warnings to stderr
+        os.environ.setdefault("OPENCV_VIDEOIO_DEBUG", "0")
+
+        log = logging.getLogger("capture")
+
+        # Try DSHOW backend first (more stable on Windows), fall back to MSMF
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
         if not cap.isOpened():
-            logging.getLogger("live").error("Cannot open camera")
+            cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            log.error("Cannot open camera index %d", camera_index)
             cam_state["cam_running"] = False
             return
-        
-        for _ in range(3): # warmup
+
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
+        # Warmup — discard first few frames
+        for _ in range(5):
             cap.read()
-            
+
+        consecutive_failures = 0
+        MAX_FAILURES = 30  # stop thread after 30 consecutive bad reads (~1s)
+
         while cam_state["cam_running"]:
             ret, frame = cap.read()
-            if ret:
+            if ret and frame is not None:
                 cam_state["latest_frame"] = frame
                 cam_state["frame_timestamp"] = time.time()
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_FAILURES:
+                    log.error("Camera lost after %d consecutive failures — stopping", MAX_FAILURES)
+                    cam_state["cam_running"] = False
+                    break
+                time.sleep(0.033)  # ~30fps pace on failure, avoids spam
+
         cap.release()
-        logging.getLogger("live").info("Capture thread exited")
+        log.info("Capture thread exited")
 
     def _is_sharp_enough(frame, threshold=100.0):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -930,7 +969,7 @@ with tab_camera:
                         if explanation:
                             cam_state["last_explanation"] = explanation
                             cam_state["board_state"] = board_state
-                            st.session_state["last_spoken_explanation"] = explanation
+                            cam_state["last_spoken_explanation"] = explanation
                             record_event(profile, "explanation")
                             speak(explanation)
                             _handle_voice_interaction(board_state, profile, "math")
@@ -959,7 +998,7 @@ with tab_camera:
                 cam_state["voice_active"] = True
                 try:
                     explanation = cam_state["last_explanation"]
-                    st.session_state["last_spoken_explanation"] = explanation
+                    cam_state["last_spoken_explanation"] = explanation
                     speak(explanation)
                     profile = get_profile()
                     _handle_voice_interaction(cam_state["board_state"], profile, "math")

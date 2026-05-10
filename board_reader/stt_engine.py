@@ -163,6 +163,14 @@ class STTEngine:
             text = r.recognize_google(audio)
             logger.info("STT: fallback transcribed %d chars", len(text))
             return text if text else None
+        except ImportError:
+            logger.debug("STT: SpeechRecognition not installed — no fallback available")
+            return None
         except Exception as exc:
-            logger.error("STT: fallback also failed: %s", exc)
+            # Only log as error if faster-whisper was also unavailable (total failure)
+            # If faster-whisper is loaded, this path shouldn't be reached
+            if self._model is None:
+                logger.error("STT: fallback also failed: %s", exc)
+            else:
+                logger.debug("STT: fallback called unexpectedly: %s", exc)
             return None

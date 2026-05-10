@@ -36,8 +36,12 @@ def _get_paddle_ocr():
 def _get_latex_ocr():
     global _latex_ocr_instance
     if _latex_ocr_instance is None:
-        from pix2tex.cli import LatexOCR  # type: ignore
-        _latex_ocr_instance = LatexOCR()
+        try:
+            from pix2tex.cli import LatexOCR  # type: ignore
+            _latex_ocr_instance = LatexOCR()
+        except Exception as exc:
+            logger.warning("LaTeX OCR (pix2tex) unavailable — torch/dll issue: %s. Skipping LaTeX OCR.", exc)
+            _latex_ocr_instance = None  # stays None — extract_latex will return ""
     return _latex_ocr_instance
 
 
@@ -90,20 +94,21 @@ def extract_text(image: np.ndarray) -> str:
 def extract_latex(image: np.ndarray) -> str:
     """Run LaTeX-OCR (pix2tex) on *image* and return the detected LaTeX string.
 
-    Returns ``""`` on any failure.
+    Returns ``""`` silently if pix2tex is unavailable (torch/dll issues on Windows).
     """
     try:
+        model = _get_latex_ocr()
+        if model is None:
+            return ""  # pix2tex unavailable — already warned at load time
         from PIL import Image as PILImage  # type: ignore
         pil_image = PILImage.fromarray(image)
-        model = _get_latex_ocr()
         result = model(pil_image)
         if result is None:
-            logger.info("LaTeX OCR: returned None")
             return ""
         logger.info("LaTeX OCR: result=%r", str(result)[:80])
         return str(result)
     except Exception as exc:
-        logger.error("LaTeX OCR failed: %s", exc, exc_info=True)
+        logger.debug("LaTeX OCR failed: %s", exc)  # debug only — not an error
         return ""
 
 

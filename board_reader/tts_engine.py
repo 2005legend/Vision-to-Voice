@@ -22,7 +22,6 @@ _CHUNK_SIZE = 300
 
 def _split_sentences(text: str) -> list[str]:
     """Split text into sentence-sized chunks for reliable TTS delivery."""
-    # Split on sentence boundaries
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     chunks: list[str] = []
     current = ""
@@ -34,7 +33,6 @@ def _split_sentences(text: str) -> list[str]:
         else:
             if current:
                 chunks.append(current)
-            # If single sentence is too long, split on commas
             if len(s) > _CHUNK_SIZE:
                 parts = re.split(r'(?<=,)\s+', s)
                 sub = ""
@@ -55,7 +53,7 @@ def _split_sentences(text: str) -> list[str]:
 
 
 def _speak_powershell(text: str) -> subprocess.Popen | None:
-    """Speak text via Windows SAPI through PowerShell. Returns the Popen object so it can be killed."""
+    """Start a PowerShell SAPI process. Returns Popen so caller can kill it."""
     safe = text.replace("'", "''")
     cmd = (
         f"Add-Type -AssemblyName System.Speech; "
@@ -68,7 +66,7 @@ def _speak_powershell(text: str) -> subprocess.Popen | None:
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return proc
     except FileNotFoundError:
@@ -77,7 +75,7 @@ def _speak_powershell(text: str) -> subprocess.Popen | None:
 
 
 def _speak_pyttsx3(text: str) -> None:
-    """Fallback: pyttsx3. Creates a fresh engine each call to avoid singleton issues."""
+    """Fallback TTS via pyttsx3."""
     import pyttsx3  # type: ignore
     engine = pyttsx3.init()
     engine.setProperty("rate", 150)
@@ -86,83 +84,90 @@ def _speak_pyttsx3(text: str) -> None:
 
 
 class TTSEngine:
-    """Queues text and plays it sequentially in a background thread."""
+    """Queues text and plays it sequentially in a background thread.
+
+    Key design:
+    - _current_proc: the active PowerShell process (None when idle)
+    - _proc_lock: protects _current_proc across threads
+    - interrupt(): kills _current_proc immediately + drains queue + unblocks worker
+    - pause() / resume(): pause after current chunk (used for STT barge-in)
+    """
 
     def __init__(self, model_name: str = "") -> None:
         self.model_name = model_name
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
-        self._pause_event.set()  # set = not paused; clear = paused
+        self._pause_event.set()          # set = not paused
         self._thread: threading.Thread | None = None
         self._current_proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
 
     def enqueue(self, text: str) -> None:
-        """Split text into sentence chunks and add each to the playback queue."""
+        """Split text into sentence chunks and add to playback queue."""
         chunks = _split_sentences(text)
         logger.debug("TTS enqueue: %d chunk(s) from %d chars", len(chunks), len(text))
         for chunk in chunks:
             self._queue.put(chunk)
 
     def interrupt(self) -> None:
-        """Interrupt current speech — clear the queue and stop after current chunk."""
-        # Drain the queue so no more chunks play
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-            except Exception:
-                break
-        self._pause_event.clear()
-        logger.debug("TTS interrupted and queue cleared")
+        """Instantly stop current speech and clear the queue.
 
-    def pause(self) -> None:
-        """Signal worker to stop after the current chunk finishes."""
-        self._pause_event.clear()
-        logger.debug("TTS paused")
+        1. Kill the active PowerShell process (stops audio mid-word)
+        2. Drain the queue (no more chunks will play)
+        3. Ensure pause_event is SET so the worker can speak again after
+        """
+        logger.info("TTS: interrupt — killing active proc and clearing queue")
 
-    def resume(self) -> None:
-        """Allow worker to continue processing the queue."""
-        self._pause_event.set()
-        logger.debug("TTS resumed")
-        
-    def interrupt(self) -> None:
-        """Instantly stop current speech and clear the queue (Voice Barge-in)."""
-        logger.info("TTS interrupt triggered. Clearing queue...")
-        # Empty the queue
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-            except queue.Empty:
-                break
-                
-        # Instantly kill the currently playing PowerShell process
+        # Kill the currently speaking process immediately
         with self._proc_lock:
-            if self._current_proc:
+            if self._current_proc is not None:
                 try:
                     self._current_proc.kill()
-                    logger.debug("Killed active TTS process.")
+                    logger.debug("TTS: killed active PowerShell proc")
                 except Exception as e:
-                    logger.debug(f"Could not kill TTS proc: {e}")
+                    logger.debug("TTS: could not kill proc: %s", e)
                 self._current_proc = None
+
+        # Drain the queue
+        drained = 0
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+                drained += 1
+            except queue.Empty:
+                break
+        logger.debug("TTS: drained %d queued chunks", drained)
+
+        # IMPORTANT: unblock the worker so it can speak again after interrupt
+        self._pause_event.set()
+
+    def pause(self) -> None:
+        """Pause after the current chunk finishes (soft pause for STT)."""
+        self._pause_event.clear()
+        logger.debug("TTS: paused")
+
+    def resume(self) -> None:
+        """Resume speaking from the queue."""
+        self._pause_event.set()
+        logger.debug("TTS: resumed")
 
     def start(self) -> None:
         """Start the background worker thread."""
         self._stop_event.clear()
+        self._pause_event.set()
         self._thread = threading.Thread(target=self._worker, daemon=True, name="tts-worker")
         self._thread.start()
         logger.info("TTS worker started")
 
     def stop(self, drain: bool = True) -> None:
-        """Stop the worker, optionally waiting for the queue to drain."""
-        if drain:
-            self._queue.join()
+        """Stop the worker thread."""
+        self.interrupt()  # kill any active speech first
         self._stop_event.set()
         self._queue.put(None)
         if self._thread is not None:
-            self._thread.join(timeout=10)
+            self._thread.join(timeout=5)
         logger.info("TTS worker stopped")
 
     def _worker(self) -> None:
@@ -177,26 +182,32 @@ class TTSEngine:
                 self._queue.task_done()
                 break
 
-            # Block here if paused — resumes instantly when resume() is called
+            # Wait if paused — unblocks instantly on resume() or interrupt()
             self._pause_event.wait()
+
+            # Check again after unblocking — interrupt() may have drained queue
+            if self._stop_event.is_set():
+                self._queue.task_done()
+                break
 
             try:
                 logger.info("TTS speaking: %r", text[:80])
                 proc = _speak_powershell(text)
-                
-                if proc:
+
+                if proc is not None:
                     with self._proc_lock:
                         self._current_proc = proc
                     try:
-                        # Wait for the process to finish speaking
                         proc.wait(timeout=120)
                     except subprocess.TimeoutExpired:
                         proc.kill()
                     finally:
                         with self._proc_lock:
-                            self._current_proc = None
-                            
-                logger.info("TTS done")
+                            # Only clear if it's still our proc (interrupt may have set it to None)
+                            if self._current_proc is proc:
+                                self._current_proc = None
+
+                logger.info("TTS done speaking chunk")
             except Exception as exc:
                 logger.error("TTS error: %s\n%s", exc, traceback.format_exc())
             finally:
