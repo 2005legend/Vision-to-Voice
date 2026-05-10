@@ -138,39 +138,81 @@ def _load_bgr(uploaded) -> np.ndarray:
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 def _handle_voice_interaction(board_state, profile, mode="math"):
-    """Handles voice interaction — only called from background voice thread, never main thread."""
+    """Speak explanation while simultaneously listening for student interruption.
+
+    - Starts TTS in background
+    - Listens on mic concurrently
+    - If student speaks → interrupt TTS immediately → answer → listen again
+    - If no speech detected → TTS finishes naturally → done
+    - Works with or without headphones (speaker mode just has a short delay before listening)
+    - Never called from the main Streamlit thread
+    """
     if not board_state:
         return
+
+    import threading
+    import time
 
     stt = get_stt()
     tts = get_tts()
     cfg = get_config()
-    import time
-
     is_headphones = st.session_state.get("barge_in_enabled", True)
 
-    if is_headphones:
-        # Pause TTS, listen, resume
-        tts.pause()
-        question = stt.listen(timeout=15.0)
-        tts.resume()
-    else:
-        # Speaker mode: wait for TTS queue to drain, then listen once
-        deadline = time.time() + 60.0
+    # In speaker mode, wait a moment for TTS to finish before listening
+    # to avoid the mic picking up the speaker output
+    if not is_headphones:
+        deadline = time.time() + 90.0
         while time.time() < deadline:
             if tts._queue.empty():
+                time.sleep(0.5)  # small extra gap so last word finishes
                 break
             time.sleep(0.3)
+        # Now listen once
         question = stt.listen(timeout=8.0)
+        if question:
+            tts.interrupt()
+            record_event(profile, "followup")
+            answer = handle_doubt(question, board_state, cfg, profile)
+            adapt_profile(profile)
+            save_profile(profile)
+            speak(answer)
+            _handle_voice_interaction(board_state, profile, mode)
+        return
 
+    # Headphone mode: listen concurrently while TTS is speaking
+    # Use an event to signal when speech is detected
+    speech_detected = threading.Event()
+    question_holder = [None]
+
+    def _listen_worker():
+        # Small delay so TTS starts first and mic doesn't catch the first word
+        time.sleep(0.3)
+        q = stt.listen(timeout=30.0)
+        if q:
+            question_holder[0] = q
+            speech_detected.set()
+
+    listener = threading.Thread(target=_listen_worker, daemon=True, name="stt-concurrent")
+    listener.start()
+
+    # Wait until either: student spoke, or TTS queue drained naturally
+    while not speech_detected.is_set():
+        if tts._queue.empty():
+            time.sleep(0.5)
+            # Give listener a moment to catch trailing speech
+            speech_detected.wait(timeout=2.0)
+            break
+        time.sleep(0.1)
+
+    question = question_holder[0]
     if question:
         tts.interrupt()
-        record_event(profile, "interrupt" if is_headphones else "followup")
+        record_event(profile, "interrupt")
         answer = handle_doubt(question, board_state, cfg, profile)
         adapt_profile(profile)
         save_profile(profile)
         speak(answer)
-        # One level of recursion only — don't loop forever
+        # Keep listening after the answer too
         _handle_voice_interaction(board_state, profile, mode)
 
 
@@ -606,16 +648,17 @@ with tab_camera:
     @st.cache_resource
     def get_cam_state():
         return {
-            "cam_running":        False,
-            "live_mode_active":   False,
-            "latest_frame":       None,
-            "ai_running":         False,
-            "last_explanation":   "",
-            "voice_trigger":      False,
-            "voice_active":       False,
-            "board_state":        None,
-            "processed_frames":   0,
-            "frame_timestamp":    0.0
+            "cam_running":          False,
+            "live_mode_active":     False,
+            "latest_frame":         None,
+            "ai_running":           False,
+            "last_explanation":     "",
+            "voice_trigger":        False,
+            "ask_question_trigger": False,
+            "voice_active":         False,
+            "board_state":          None,
+            "processed_frames":     0,
+            "frame_timestamp":      0.0
         }
 
     cam_state = get_cam_state()
@@ -718,6 +761,27 @@ with tab_camera:
     def _voice_thread(cam_state: dict):
         import time
         while cam_state["cam_running"]:
+            # Handle manual "Ask a Question" button trigger
+            if cam_state.get("ask_question_trigger"):
+                cam_state["ask_question_trigger"] = False
+                cam_state["voice_active"] = True
+                try:
+                    get_tts().interrupt()
+                    profile = get_profile()
+                    question = get_stt().listen(timeout=10.0)
+                    if question:
+                        answer = handle_doubt(question, cam_state["board_state"], get_config(), profile)
+                        record_event(profile, "followup")
+                        adapt_profile(profile)
+                        save_profile(profile)
+                        speak(answer)
+                except Exception as e:
+                    logging.getLogger("live").error("Ask question error: %s", e, exc_info=True)
+                finally:
+                    cam_state["voice_active"] = False
+                continue
+
+            # Handle auto voice trigger from AI pipeline
             if not cam_state.get("voice_trigger"):
                 time.sleep(0.2)
                 continue
@@ -786,6 +850,11 @@ with tab_camera:
         if st.button("🔇 Stop Speaking", key="stop_tts_cam"):
             get_tts().interrupt()
             st.success("Stopped.")
+
+    # Manual ask-question button — works anytime camera is on
+    if cam_state["cam_running"] and cam_state.get("board_state"):
+        if st.button("🎤 Ask a Question", key="ask_question_cam", type="secondary"):
+            cam_state["ask_question_trigger"] = True
 
     # ── Status indicators ─────────────────────────────────────────────────────
     status_cols = st.columns(3)
