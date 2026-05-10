@@ -138,65 +138,39 @@ def _load_bgr(uploaded) -> np.ndarray:
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 def _handle_voice_interaction(board_state, profile, mode="math"):
-    """Handles continuous, touchless voice interaction for visually impaired users."""
+    """Handles voice interaction — only called from background voice thread, never main thread."""
     if not board_state:
         return
-        
+
     stt = get_stt()
     tts = get_tts()
     cfg = get_config()
     import time
-    import threading
-    is_main = threading.current_thread().name == "MainThread"
-    
+
     is_headphones = st.session_state.get("barge_in_enabled", True)
-    
+
     if is_headphones:
-        # Pause TTS, listen for question, then resume
+        # Pause TTS, listen, resume
         tts.pause()
-        if is_main:
-            with st.spinner("🗣️ Speaking... (Listening for your cross-question)"):
-                question = stt.listen(timeout=30.0)
-        else:
-            question = stt.listen(timeout=30.0)
+        question = stt.listen(timeout=15.0)
         tts.resume()
     else:
-        # Speaker mode: Wait for TTS to finish to prevent echo
-        if is_main:
-            with st.spinner("🗣️ Speaking... (Please wait to ask questions)"):
-                while not tts._queue.empty() or getattr(tts, "_current_proc", None) is not None:
-                    time.sleep(0.5)
-            with st.spinner("🎤 Listening for questions..."):
-                question = stt.listen(timeout=8.0)
-        else:
-            while not tts._queue.empty() or getattr(tts, "_current_proc", None) is not None:
-                time.sleep(0.5)
-            question = stt.listen(timeout=8.0)
-        
+        # Speaker mode: wait for TTS queue to drain, then listen once
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            if tts._queue.empty():
+                break
+            time.sleep(0.3)
+        question = stt.listen(timeout=8.0)
+
     if question:
-        if is_main:
-            st.info(f"🎤 You asked: {question}")
-        
-        # Stop TTS again just to be sure
         tts.interrupt()
-        tts.enqueue("Let me answer that.")
-        
         record_event(profile, "interrupt" if is_headphones else "followup")
-        
-        if is_main:
-            with st.spinner("Answering..."):
-                answer = handle_doubt(question, board_state, cfg, profile)
-        else:
-            answer = handle_doubt(question, board_state, cfg, profile)
-            
+        answer = handle_doubt(question, board_state, cfg, profile)
         adapt_profile(profile)
         save_profile(profile)
-        
-        if is_main:
-            st.success(answer)
-        
         speak(answer)
-        # Recursively allow voice interaction on the answer
+        # One level of recursion only — don't loop forever
         _handle_voice_interaction(board_state, profile, mode)
 
 
@@ -603,7 +577,6 @@ with tab_upload:
             # Auto-speak as soon as explanation is ready
             if st.session_state.get("upload_explanation"):
                 speak(st.session_state["upload_explanation"])
-                _handle_voice_interaction(st.session_state.get("upload_board_state"), profile, explain_mode)
 
         # ── Persistent results (survive reruns) ───────────────────────────────
         board_state = st.session_state.get("upload_board_state")
@@ -624,7 +597,6 @@ with tab_upload:
             if st.button("🔊 Repeat explanation", key="speak_upload"):
                 speak(explanation)
                 st.success("Speaking…")
-                _handle_voice_interaction(board_state, profile, explain_mode)
 
 
 # ── Tab 2: Camera ─────────────────────────────────────────────────────────────
@@ -783,7 +755,7 @@ with tab_camera:
                 t.start()
                 cam_state["_threads"].append(t)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         if not cam_state["cam_running"]:
             if st.button("🟢 Turn Camera ON"):
@@ -794,6 +766,7 @@ with tab_camera:
             if st.button("🔴 Turn Camera OFF"):
                 cam_state["cam_running"] = False
                 cam_state["live_mode_active"] = False
+                get_tts().interrupt()
                 st.rerun()
 
     with col2:
@@ -808,6 +781,11 @@ with tab_camera:
                     st.rerun()
         else:
             st.info("Click 'Turn Camera ON' first.")
+
+    with col3:
+        if st.button("🔇 Stop Speaking", key="stop_tts_cam"):
+            get_tts().interrupt()
+            st.success("Stopped.")
 
     # ── Status indicators ─────────────────────────────────────────────────────
     status_cols = st.columns(3)
@@ -874,11 +852,9 @@ with tab_camera:
                     board_state, explanation = run_pipeline(cam_state["latest_frame"], "math", profile)
                     cam_state["last_explanation"] = explanation
                     cam_state["board_state"] = board_state
-
                     if explanation:
-                        speak(explanation)
                         record_event(profile, "explanation")
-                        _handle_voice_interaction(board_state, profile, "math")
+                        cam_state["voice_trigger"] = True  # voice thread picks this up
 
         cam_board = cam_state.get("board_state")
         cam_explanation = cam_state.get("last_explanation")
@@ -899,8 +875,6 @@ with tab_camera:
                 if st.button("🔊 Repeat explanation", key="speak_cam"):
                     speak(cam_explanation)
                     st.success("Speaking…")
-                    profile = get_profile()
-                    _handle_voice_interaction(cam_board, profile, "math")
 
             with col_feedback:
                 st.caption("Was this helpful?")
