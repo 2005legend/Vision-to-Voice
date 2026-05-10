@@ -138,14 +138,11 @@ def _load_bgr(uploaded) -> np.ndarray:
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 def _handle_voice_interaction(board_state, profile, mode="math"):
-    """Speak explanation while simultaneously listening for student interruption.
+    """Speak explanation while simultaneously listening for student speech.
 
-    - Starts TTS in background
-    - Listens on mic concurrently
-    - If student speaks → interrupt TTS immediately → answer → listen again
-    - If no speech detected → TTS finishes naturally → done
-    - Works with or without headphones (speaker mode just has a short delay before listening)
-    - Never called from the main Streamlit thread
+    Headphone mode: STT runs concurrently with TTS. Student speaks → TTS cuts → answer.
+    Speaker mode:   TTS finishes first, then STT listens once.
+    Never called from the main Streamlit thread.
     """
     if not board_state:
         return
@@ -158,35 +155,26 @@ def _handle_voice_interaction(board_state, profile, mode="math"):
     cfg = get_config()
     is_headphones = st.session_state.get("barge_in_enabled", True)
 
-    # In speaker mode, wait a moment for TTS to finish before listening
-    # to avoid the mic picking up the speaker output
     if not is_headphones:
+        # Wait for TTS to drain, then listen once
         deadline = time.time() + 90.0
         while time.time() < deadline:
             if tts._queue.empty():
-                time.sleep(0.5)  # small extra gap so last word finishes
+                time.sleep(0.5)
                 break
             time.sleep(0.3)
-        # Now listen once
         question = stt.listen(timeout=8.0)
         if question:
             tts.interrupt()
-            record_event(profile, "followup")
-            answer = handle_doubt(question, board_state, cfg, profile)
-            adapt_profile(profile)
-            save_profile(profile)
-            speak(answer)
-            _handle_voice_interaction(board_state, profile, mode)
+            _dispatch_voice_command(question, board_state, profile, mode)
         return
 
-    # Headphone mode: listen concurrently while TTS is speaking
-    # Use an event to signal when speech is detected
+    # Headphone mode: concurrent listen + speak
     speech_detected = threading.Event()
     question_holder = [None]
 
     def _listen_worker():
-        # Small delay so TTS starts first and mic doesn't catch the first word
-        time.sleep(0.3)
+        time.sleep(0.3)  # let TTS start first
         q = stt.listen(timeout=30.0)
         if q:
             question_holder[0] = q
@@ -195,11 +183,9 @@ def _handle_voice_interaction(board_state, profile, mode="math"):
     listener = threading.Thread(target=_listen_worker, daemon=True, name="stt-concurrent")
     listener.start()
 
-    # Wait until either: student spoke, or TTS queue drained naturally
     while not speech_detected.is_set():
         if tts._queue.empty():
             time.sleep(0.5)
-            # Give listener a moment to catch trailing speech
             speech_detected.wait(timeout=2.0)
             break
         time.sleep(0.1)
@@ -207,13 +193,108 @@ def _handle_voice_interaction(board_state, profile, mode="math"):
     question = question_holder[0]
     if question:
         tts.interrupt()
-        record_event(profile, "interrupt")
-        answer = handle_doubt(question, board_state, cfg, profile)
-        adapt_profile(profile)
-        save_profile(profile)
-        speak(answer)
-        # Keep listening after the answer too
-        _handle_voice_interaction(board_state, profile, mode)
+        _dispatch_voice_command(question, board_state, profile, mode)
+
+
+def _dispatch_voice_command(text: str, board_state, profile, mode: str = "math"):
+    """Route a spoken command to the right action.
+
+    Commands (case-insensitive):
+      "repeat" / "say again" / "again"  → replay last explanation
+      "stop" / "quiet" / "shut up"      → stop TTS, stay ready
+      "capture" / "next" / "new photo"  → trigger a new capture
+      "start live" / "live mode"        → start live monitoring
+      "stop live" / "stop monitoring"   → stop live monitoring
+      "camera on" / "turn on camera"    → turn camera on
+      "camera off" / "turn off camera"  → turn camera off
+      anything else                     → treat as a doubt question
+    """
+    import logging
+    log = logging.getLogger("voice.cmd")
+    t = text.lower().strip()
+    tts = get_tts()
+    cfg = get_config()
+
+    log.info("Voice command received: %r", t)
+
+    # ── Help ──────────────────────────────────────────
+    if any(w in t for w in ["help", "what can you do", "commands", "options"]):
+        speak(
+            "Here are the voice commands. "
+            "Say 'camera on' to start the camera. "
+            "Say 'capture' or 'read board' to scan the board. "
+            "Say 'start live' to monitor automatically. "
+            "Say 'stop live' to stop monitoring. "
+            "Say 'repeat' to hear the last explanation again. "
+            "Say 'stop' to stop speaking. "
+            "Or just ask any question about the board."
+        )
+        return
+
+    # ── Stop ──────────────────────────────────────────
+    if any(w in t for w in ["stop", "quiet", "shut up", "silence", "enough"]):
+        tts.interrupt()
+        speak("Okay, I'll stop.")
+        return
+
+    # ── Repeat ────────────────────────────────────────
+    if any(w in t for w in ["repeat", "say again", "again", "replay", "once more"]):
+        record_event(profile, "repeat")
+        last = st.session_state.get("last_spoken_explanation", "")
+        if last:
+            speak(last)
+            _handle_voice_interaction(board_state, profile, mode)
+        else:
+            speak("Nothing to repeat yet.")
+        return
+
+    # ── Capture new photo ─────────────────────────────
+    if any(w in t for w in ["capture", "next", "new photo", "take photo", "scan", "read board"]):
+        cam_state = get_cam_state()
+        cam_state["manual_capture_trigger"] = True
+        speak("Capturing now.")
+        return
+
+    # ── Live mode on ──────────────────────────────────
+    if any(w in t for w in ["start live", "live mode", "start monitoring", "auto mode"]):
+        cam_state = get_cam_state()
+        cam_state["live_mode_active"] = True
+        speak("Live mode started. I'll speak whenever the board changes.")
+        return
+
+    # ── Live mode off ─────────────────────────────────
+    if any(w in t for w in ["stop live", "stop monitoring", "manual mode", "pause live"]):
+        cam_state = get_cam_state()
+        cam_state["live_mode_active"] = False
+        speak("Live mode stopped.")
+        return
+
+    # ── Camera on ─────────────────────────────────────
+    if any(w in t for w in ["camera on", "turn on camera", "start camera", "open camera"]):
+        cam_state = get_cam_state()
+        cam_state["camera_on_trigger"] = True
+        speak("Turning camera on.")
+        return
+
+    # ── Camera off ────────────────────────────────────
+    if any(w in t for w in ["camera off", "turn off camera", "stop camera", "close camera"]):
+        cam_state = get_cam_state()
+        cam_state["cam_running"] = False
+        cam_state["live_mode_active"] = False
+        tts.interrupt()
+        speak("Camera off.")
+        return
+
+    # ── Doubt / question ──────────────────────────────
+    record_event(profile, "followup")
+    answer = handle_doubt(text, board_state, cfg, profile)
+    adapt_profile(profile)
+    save_profile(profile)
+    # Store for potential repeat
+    st.session_state["last_spoken_explanation"] = answer
+    speak(answer)
+    # Keep listening after answering
+    _handle_voice_interaction(board_state, profile, mode)
 
 
 # ── Pipeline helpers ──────────────────────────────────────────────────────────
@@ -261,6 +342,30 @@ def run_pipeline(frame_bgr: np.ndarray, mode: str = "math", profile: StudentProf
             status.update(label=f"Error: {exc}", state="error")
             return None, None
     return board_state, explanation
+
+
+def _run_pipeline_bg(frame_bgr, mode: str = "math", profile=None):
+    """Pipeline for background threads — no Streamlit UI calls."""
+    import logging
+    log = logging.getLogger("pipeline.bg")
+    config = get_config()
+    try:
+        preprocessed = preprocess(frame_bgr)
+        try:
+            plain = extract_text(preprocessed)
+            latex = extract_latex(preprocessed)
+            ocr_text = combine_ocr(plain, latex)
+        except Exception:
+            ocr_text = combine_ocr("", "")
+        board_state = call_nim(preprocessed, ocr_text, config)
+        if board_state is None:
+            return None, None
+        delta = detect_change(board_state, None)
+        explanation = call_gemini_api(delta, board_state, config, profile=profile, mode=mode)
+        return board_state, explanation
+    except Exception as exc:
+        log.error("BG pipeline error: %s", exc, exc_info=True)
+        return None, None
 
 
 def run_diagram_pipeline(frame_bgr: np.ndarray) -> str | None:
@@ -648,17 +753,19 @@ with tab_camera:
     @st.cache_resource
     def get_cam_state():
         return {
-            "cam_running":          False,
-            "live_mode_active":     False,
-            "latest_frame":         None,
-            "ai_running":           False,
-            "last_explanation":     "",
-            "voice_trigger":        False,
-            "ask_question_trigger": False,
-            "voice_active":         False,
-            "board_state":          None,
-            "processed_frames":     0,
-            "frame_timestamp":      0.0
+            "cam_running":            False,
+            "live_mode_active":       False,
+            "latest_frame":           None,
+            "ai_running":             False,
+            "last_explanation":       "",
+            "voice_trigger":          False,
+            "ask_question_trigger":   False,
+            "manual_capture_trigger": False,
+            "camera_on_trigger":      False,
+            "voice_active":           False,
+            "board_state":            None,
+            "processed_frames":       0,
+            "frame_timestamp":        0.0
         }
 
     cam_state = get_cam_state()
@@ -757,45 +864,88 @@ with tab_camera:
 
             time.sleep(capture_interval)
 
-    # ── Thread 3: Voice ──────────────────────────────
+    # ── Thread 3: Always-on voice loop ──────────────────────────────
     def _voice_thread(cam_state: dict):
+        """Always-on voice loop.
+
+        States:
+          - Idle (no explanation playing): listens for commands every cycle
+          - Speaking: listens concurrently (headphone) or after (speaker)
+          - After answer: keeps listening for follow-ups
+        """
         import time
+        log = logging.getLogger("voice")
+
+        # Announce readiness once
+        time.sleep(2.0)  # wait for TTS engine to start
+        speak("Vision to Voice is ready. Say 'camera on' to start, or 'help' for commands.")
+
         while cam_state["cam_running"]:
-            # Handle manual "Ask a Question" button trigger
-            if cam_state.get("ask_question_trigger"):
-                cam_state["ask_question_trigger"] = False
+
+            # ── Handle manual capture trigger from voice command ──
+            if cam_state.get("manual_capture_trigger"):
+                cam_state["manual_capture_trigger"] = False
+                if cam_state.get("latest_frame") is not None:
+                    cam_state["voice_active"] = True
+                    try:
+                        profile = get_profile()
+                        board_state, explanation = _run_pipeline_bg(cam_state["latest_frame"], "math", profile)
+                        if explanation:
+                            cam_state["last_explanation"] = explanation
+                            cam_state["board_state"] = board_state
+                            st.session_state["last_spoken_explanation"] = explanation
+                            record_event(profile, "explanation")
+                            speak(explanation)
+                            _handle_voice_interaction(board_state, profile, "math")
+                    except Exception as e:
+                        log.error("Manual capture error: %s", e, exc_info=True)
+                        speak("Sorry, capture failed.")
+                    finally:
+                        cam_state["voice_active"] = False
+                else:
+                    speak("Camera is not ready yet.")
+                continue
+
+            # ── Handle camera on trigger from voice command ──
+            if cam_state.get("camera_on_trigger"):
+                cam_state["camera_on_trigger"] = False
+                if not cam_state["cam_running"]:
+                    cam_state["cam_running"] = True
+                    ensure_threads_running(cam_state, cfg.camera_index)
+                continue
+
+            # ── Handle AI pipeline voice trigger ──
+            if cam_state.get("voice_trigger"):
+                cam_state["voice_trigger"] = False
                 cam_state["voice_active"] = True
                 try:
-                    get_tts().interrupt()
+                    explanation = cam_state["last_explanation"]
+                    st.session_state["last_spoken_explanation"] = explanation
+                    speak(explanation)
                     profile = get_profile()
-                    question = get_stt().listen(timeout=10.0)
-                    if question:
-                        answer = handle_doubt(question, cam_state["board_state"], get_config(), profile)
-                        record_event(profile, "followup")
-                        adapt_profile(profile)
-                        save_profile(profile)
-                        speak(answer)
+                    _handle_voice_interaction(cam_state["board_state"], profile, "math")
                 except Exception as e:
-                    logging.getLogger("live").error("Ask question error: %s", e, exc_info=True)
+                    log.error("Voice trigger error: %s", e, exc_info=True)
                 finally:
                     cam_state["voice_active"] = False
                 continue
 
-            # Handle auto voice trigger from AI pipeline
-            if not cam_state.get("voice_trigger"):
-                time.sleep(0.2)
-                continue
+            # ── Idle: always listen for commands ──
+            # Even when nothing is happening, student can say "capture", "repeat", etc.
+            if not cam_state.get("voice_active"):
+                cam_state["voice_active"] = True
+                try:
+                    q = get_stt().listen(timeout=5.0)
+                    if q:
+                        board_state = cam_state.get("board_state")
+                        profile = get_profile()
+                        _dispatch_voice_command(q, board_state, profile, "math")
+                except Exception as e:
+                    log.error("Idle listen error: %s", e, exc_info=True)
+                finally:
+                    cam_state["voice_active"] = False
 
-            cam_state["voice_trigger"] = False
-            cam_state["voice_active"] = True
-            try:
-                speak(cam_state["last_explanation"])
-                profile = get_profile()
-                _handle_voice_interaction(cam_state["board_state"], profile, "math")
-            except Exception as e:
-                logging.getLogger("live").error("Voice thread error: %s", e, exc_info=True)
-            finally:
-                cam_state["voice_active"] = False
+            time.sleep(0.1)
 
     # ── Thread launcher ──────────────────────────────
     def ensure_threads_running(cam_state: dict, camera_index: int):
