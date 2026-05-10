@@ -815,10 +815,8 @@ with tab_camera:
 
         log = logging.getLogger("capture")
 
-        # Try DSHOW backend first (more stable on Windows), fall back to MSMF
-        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(camera_index)
+        # Use default backend — iVCam requires MSMF (default on Windows), not DSHOW
+        cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             log.error("Cannot open camera index %d", camera_index)
             cam_state["cam_running"] = False
