@@ -106,7 +106,7 @@ def build_gemini_prompt(
         "- Read equations in plain spoken words.\n"
         "- If steps appear contradictory due to OCR errors, use the LAST step as the correct answer "
         "and explain the logical path to reach it.\n"
-        "- Be concise — maximum 200 words. Do not repeat yourself or second-guess your answer.\n"
+        "- Be concise and clear. Do not repeat yourself or second-guess your answer.\n"
         "- End with the final answer stated clearly."
     )
 
@@ -153,14 +153,14 @@ def _call_groq(prompt: str, config: Config) -> str | None:
                         "content": (
                             "You are a math teacher giving a spoken explanation to a blind student. "
                             "Be confident and concise. Never second-guess yourself mid-explanation. "
-                            "State the answer clearly at the end. Maximum 200 words."
+                            "State the answer clearly at the end."
                         ),
                     },
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
                 top_p=0.9,
-                max_tokens=600,
+                max_tokens=2048,
                 stream=True,
             )
             parts = [c.choices[0].delta.content for c in completion
