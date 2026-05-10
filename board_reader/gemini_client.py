@@ -108,6 +108,7 @@ def call_gemini_api(
     delta: ChangeDelta,
     board_state: BoardState,
     config: Config,
+    profile: StudentProfile | None = None,
     mode: str = "math",
 ) -> str | None:
     """Generate a pedagogical explanation using Groq (fast) with NIM Mistral as fallback.
@@ -115,7 +116,7 @@ def call_gemini_api(
     mode: "math" | "general" | "study"
     Returns the explanation text string on success, or None on error.
     """
-    prompt = build_gemini_prompt(delta, board_state, config, mode=mode)
+    prompt = build_gemini_prompt(delta, board_state, config, profile=profile, mode=mode)
 
     # Try Groq first if key is configured
     if config.groq_api_key:

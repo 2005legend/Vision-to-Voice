@@ -10,6 +10,7 @@ import logging
 import os
 import tempfile
 import wave
+import typing
 
 import numpy as np
 
@@ -46,24 +47,24 @@ class STTEngine:
             logger.info("STT: faster-whisper loaded (model=%s device=%s)", self._model_size, device_used)
             print(f"[STT] Using model: faster-whisper/{self._model_size} on {device_used}")
         except Exception as exc:
-            logger.warning("STT: faster-whisper unavailable: %s — will use SpeechRecognition fallback", exc)
-            print(f"[STT] faster-whisper failed to load: {exc} — falling back to SpeechRecognition")
+            logger.warning("STT: faster-whisper unavailable: %s - will use SpeechRecognition fallback", exc)
+            print(f"[STT] faster-whisper failed to load: {exc} - falling back to SpeechRecognition")
             self._model = None
 
-    def listen(self, timeout: float = 10.0) -> str | None:
+    def listen(self, timeout: float = 10.0, on_speech_start: typing.Callable[[], None] | None = None) -> str | None:
         """Record from mic until silence or timeout. Returns transcript or None.
 
         Never raises — all errors are caught and logged.
         """
         try:
             if self._model is not None:
-                return self._listen_whisper(timeout)
+                return self._listen_whisper(timeout, on_speech_start)
             return self._listen_fallback(timeout)
         except Exception as exc:
             logger.error("STT: listen() failed: %s", exc)
             return None
 
-    def _listen_whisper(self, timeout: float) -> str | None:
+    def _listen_whisper(self, timeout: float, on_speech_start=None) -> str | None:
         try:
             import sounddevice as sd  # type: ignore
         except ImportError:
@@ -76,6 +77,8 @@ class STTEngine:
 
         frames: list[np.ndarray] = []
         silent_chunks = 0
+        consecutive_voice = 0
+        barge_in_triggered = False
 
         # Calibrate silence threshold from actual ambient noise (0.5s sample)
         calibration_chunks = 5
@@ -103,10 +106,16 @@ class STTEngine:
                     rms = float(np.sqrt(np.mean(chunk ** 2)))
                     if rms < dynamic_threshold:
                         silent_chunks += 1
+                        consecutive_voice = 0
                         if silent_chunks >= silence_chunks_needed and len(frames) > 10:
                             break
                     else:
                         silent_chunks = 0
+                        consecutive_voice += 1
+                        if on_speech_start and not barge_in_triggered and consecutive_voice >= 3:
+                            logger.info("STT: Voice barge-in detected!")
+                            barge_in_triggered = True
+                            on_speech_start()
         except Exception as exc:
             logger.error("STT: sounddevice recording failed: %s", exc)
             return self._listen_fallback(timeout)

@@ -61,3 +61,11 @@ class StudentProfile:
     explanation_count: int = 0
     silence_duration: float = 0.0
     preferred_detail: str = "medium"   # "brief" | "medium" | "detailed" | "slow"
+
+    def to_json(self) -> str:
+        return json.dumps(self.__dict__)
+
+    @classmethod
+    def from_json(cls, data: str) -> "StudentProfile":
+        d = json.loads(data)
+        return cls(**d)

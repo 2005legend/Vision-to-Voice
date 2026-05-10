@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from board_reader.models import StudentProfile
 
@@ -98,7 +99,6 @@ def load_profile(path: str) -> StudentProfile:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        # Fill in any new fields that may not exist in older saved profiles
         defaults = StudentProfile.__dataclass_fields__
         for field_name, field_obj in defaults.items():
             if field_name not in data:
@@ -110,3 +110,19 @@ def load_profile(path: str) -> StudentProfile:
     except Exception as exc:
         logger.warning("RL: failed to load profile from %s: %s — starting fresh", path, exc)
         return StudentProfile(grade_level=10)
+
+
+def save_profile_on_change(profile: StudentProfile, path: str) -> None:
+    """Save profile only if it has changed from the last saved version.
+    
+    This prevents excessive disk writes during active sessions.
+    """
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                saved_data = json.load(fh)
+            if saved_data.get("preferred_detail") == profile.preferred_detail:
+                return
+        persist_profile(profile, path)
+    except Exception as exc:
+        logger.warning("RL: failed to check/save profile: %s", exc)

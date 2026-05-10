@@ -9,7 +9,7 @@ import numpy as np
 
 from board_reader import gemini_client, nim_client
 from board_reader.config import Config
-from board_reader.models import BoardState, BoardStep, ChangeDelta
+from board_reader.models import BoardState, BoardStep, ChangeDelta, StudentProfile
 
 if TYPE_CHECKING:
     from board_reader.tts_engine import TTSEngine
@@ -69,9 +69,9 @@ def detect_change(current: BoardState, previous: BoardState | None) -> ChangeDel
     )
 
 
-def call_gemini(delta: ChangeDelta, current: BoardState, config: Config) -> str | None:
+def call_gemini(delta: ChangeDelta, current: BoardState, config: Config, profile: StudentProfile | None = None) -> str | None:
     """Delegate to gemini_client to generate a pedagogical explanation."""
-    return gemini_client.call_gemini_api(delta, current, config)
+    return gemini_client.call_gemini_api(delta, current, config, profile=profile)
 
 
 def process_frame(
@@ -80,6 +80,7 @@ def process_frame(
     previous_board_state: BoardState | None,
     config: Config,
     tts_engine: TTSEngine,
+    profile: StudentProfile | None = None,
 ) -> BoardState | None:
     """Run the per-frame pipeline.
 
@@ -96,7 +97,7 @@ def process_frame(
 
     delta = detect_change(current_state, previous_board_state)
     if delta is not None:
-        explanation = call_gemini(delta, current_state, config)
+        explanation = call_gemini(delta, current_state, config, profile=profile)
         if explanation is not None:
             tts_engine.enqueue(explanation)
 

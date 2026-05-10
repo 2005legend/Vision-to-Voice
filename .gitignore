@@ -22,6 +22,9 @@ CROHME DATASET/
 archive.zip
 *.zip
 
+# Real config with API keys — use config.yaml.example as template
+config.yaml
+
 # Logs & runtime output
 *.log
 board_reader.log

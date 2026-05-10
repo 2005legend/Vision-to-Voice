@@ -12,6 +12,8 @@ class Config:
     nim_api_key: str
     nim_explain_model: str     # text model for explanations, e.g. mistralai/mistral-small-24b-instruct
     camera_index: int          # default 0
+    camera_width: int          # default 1920
+    camera_height: int         # default 1080
     capture_interval: float    # seconds, default 2.0
     grade_level: int           # 10 or 12
     log_level: str             # DEBUG | INFO | WARNING | ERROR
@@ -87,6 +89,16 @@ def load_config(path: str = "config.yaml") -> Config:
         camera_index = 0
     camera_index = int(camera_index)
 
+    camera_width = _get_nested(data, "camera", "width")
+    if camera_width is None:
+        camera_width = 1920
+    camera_width = int(camera_width)
+
+    camera_height = _get_nested(data, "camera", "height")
+    if camera_height is None:
+        camera_height = 1080
+    camera_height = int(camera_height)
+
     capture_interval = _get_nested(data, "camera", "capture_interval")
     if capture_interval is None:
         capture_interval = 2.0
@@ -122,6 +134,8 @@ def load_config(path: str = "config.yaml") -> Config:
         nim_api_key=str(nim_api_key),
         nim_explain_model=str(nim_explain_model),
         camera_index=camera_index,
+        camera_width=camera_width,
+        camera_height=camera_height,
         capture_interval=capture_interval,
         grade_level=int(grade_level),
         log_level=str(log_level),
