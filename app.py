@@ -124,7 +124,8 @@ def get_cam_state():
         "voice_active":           False,
         "board_state":            None,
         "processed_frames":       0,
-        "frame_timestamp":        0.0
+        "frame_timestamp":        0.0,
+        "selected_camera_index":  1,   # default 1 = iVCam; overridden by sidebar
     }
 
 
@@ -488,6 +489,22 @@ with st.sidebar:
     st.caption("Edit `config.yaml` to change.")
     st.divider()
 
+    # ── Camera selector ───────────────────────────────────────────────────────
+    st.subheader("📷 Camera")
+    cam_index_options = list(range(5))
+    selected_cam = st.selectbox(
+        "Camera index",
+        cam_index_options,
+        index=cam_index_options.index(cfg.camera_index) if cfg.camera_index in cam_index_options else 0,
+        format_func=lambda i: f"Index {i} {'(config default)' if i == cfg.camera_index else ''}",
+        help="0 = laptop camera, 1 = iVCam (phone). Change if wrong camera is used.",
+        key="cam_index_select",
+    )
+    # Store in cam_state so capture thread uses it
+    get_cam_state()["selected_camera_index"] = selected_cam
+    st.caption(f"Active: index **{selected_cam}**. iVCam is usually index 1.")
+    st.divider()
+
     # ── Audio Settings ────────────────────────────────────────────────────────
     st.subheader("🎧 Audio Settings")
     barge_in_mode = st.radio(
@@ -817,7 +834,7 @@ with tab_camera:
         consecutive_failures = 0
         MAX_FAILURES = 30  # stop thread after 30 consecutive bad reads (~1s)
 
-        while cam_state["cam_running"]:
+        while cam_state["cam_running"] and not cam_state.get("_restart_capture"):
             ret, frame = cap.read()
             if ret and frame is not None:
                 cam_state["latest_frame"] = frame
@@ -829,10 +846,11 @@ with tab_camera:
                     log.error("Camera lost after %d consecutive failures — stopping", MAX_FAILURES)
                     cam_state["cam_running"] = False
                     break
-                time.sleep(0.033)  # ~30fps pace on failure, avoids spam
+                time.sleep(0.033)
 
+        cam_state["_restart_capture"] = False  # reset flag
         cap.release()
-        log.info("Capture thread exited")
+        log.info("Capture thread exited (index=%d)", camera_index)
 
     def _is_sharp_enough(frame, threshold=100.0):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -992,7 +1010,8 @@ with tab_camera:
                 cam_state["camera_on_trigger"] = False
                 if not cam_state["cam_running"]:
                     cam_state["cam_running"] = True
-                    ensure_threads_running(cam_state, cfg.camera_index)
+                    idx = cam_state.get("selected_camera_index", cfg.camera_index)
+                    ensure_threads_running(cam_state, idx)
                 continue
 
             # ── AI pipeline voice trigger ────────────────────────
@@ -1016,19 +1035,30 @@ with tab_camera:
     # ── Thread launcher ──────────────────────────────
     def ensure_threads_running(cam_state: dict, camera_index: int):
         import threading
+        # Always use the sidebar-selected index
+        camera_index = cam_state.get("selected_camera_index", camera_index)
         threads = cam_state.setdefault("_threads", [])
         alive = [t for t in threads if t.is_alive()]
         cam_state["_threads"] = alive
+        alive_names = {t.name for t in alive}
 
-        if len(alive) == 3:
-            return
+        # If capture thread is running but on a different index, kill it and restart
+        last_index = cam_state.get("_active_camera_index", None)
+        if "capture" in alive_names and last_index != camera_index:
+            # Signal capture thread to stop — it will exit on next loop
+            cam_state["_restart_capture"] = True
+            # Remove from alive so it gets restarted below
+            alive = [t for t in alive if t.name != "capture"]
+            cam_state["_threads"] = alive
+            alive_names = {t.name for t in alive}
+
+        cam_state["_active_camera_index"] = camera_index
 
         targets = [
             ("capture", _capture_thread, (cam_state, camera_index)),
             ("ai",      _ai_thread,      (cam_state, cfg.capture_interval)),
             ("voice",   _voice_thread,   (cam_state,)),
         ]
-        alive_names = {t.name for t in alive}
         for name, fn, args in targets:
             if name not in alive_names:
                 t = threading.Thread(target=fn, args=args, name=name, daemon=True)
@@ -1040,7 +1070,9 @@ with tab_camera:
         if not cam_state["cam_running"]:
             if st.button("🟢 Turn Camera ON"):
                 cam_state["cam_running"] = True
-                ensure_threads_running(cam_state, cfg.camera_index)
+                # Use sidebar-selected index, not config default
+                idx = cam_state.get("selected_camera_index", cfg.camera_index)
+                ensure_threads_running(cam_state, idx)
                 st.rerun()
         else:
             if st.button("🔴 Turn Camera OFF"):
