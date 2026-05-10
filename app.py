@@ -1,4 +1,4 @@
-"""IntelliAgent Board Reader — Streamlit frontend."""
+"""Vision To Voice — Streamlit frontend."""
 
 import logging
 import os
@@ -20,11 +20,12 @@ from board_reader.gemini_client import call_gemini_api, explain_diagram
 from board_reader.tts_engine import TTSEngine
 from board_reader.stt_engine import STTEngine
 from board_reader.doubt_handler import handle_doubt
-from board_reader.rl import record_event, adapt_profile, load_profile, persist_profile
+from board_reader.rl import record_event, adapt_profile, load_profile, persist_profile, save_profile_on_change
+from board_reader.models import StudentProfile
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="IntelliAgent Board Reader",
+    page_title="Vision To Voice",
     page_icon="🎓",
     layout="wide",
 )
@@ -111,6 +112,12 @@ def get_profile():
     return st.session_state["student_profile"]
 
 
+def save_profile(profile: StudentProfile) -> None:
+    """Persist the student profile to disk after changes."""
+    cfg = get_config()
+    persist_profile(profile, cfg.rl_profile_path)
+
+
 def _safe_cfg_attr(cfg, attr: str, default=""):
     """Return cfg.attr safely — guards against stale cached Config objects."""
     val = getattr(cfg, attr, None)
@@ -130,9 +137,71 @@ def _load_bgr(uploaded) -> np.ndarray:
     pil_img = Image.open(uploaded).convert("RGB")
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
+def _handle_voice_interaction(board_state, profile, mode="math"):
+    """Handles continuous, touchless voice interaction for visually impaired users."""
+    if not board_state:
+        return
+        
+    stt = get_stt()
+    tts = get_tts()
+    cfg = get_config()
+    import time
+    import threading
+    is_main = threading.current_thread().name == "MainThread"
+    
+    is_headphones = st.session_state.get("barge_in_enabled", True)
+    
+    if is_headphones:
+        # Pause TTS, listen for question, then resume
+        tts.pause()
+        if is_main:
+            with st.spinner("🗣️ Speaking... (Listening for your cross-question)"):
+                question = stt.listen(timeout=30.0)
+        else:
+            question = stt.listen(timeout=30.0)
+        tts.resume()
+    else:
+        # Speaker mode: Wait for TTS to finish to prevent echo
+        if is_main:
+            with st.spinner("🗣️ Speaking... (Please wait to ask questions)"):
+                while not tts._queue.empty() or getattr(tts, "_current_proc", None) is not None:
+                    time.sleep(0.5)
+            with st.spinner("🎤 Listening for questions..."):
+                question = stt.listen(timeout=8.0)
+        else:
+            while not tts._queue.empty() or getattr(tts, "_current_proc", None) is not None:
+                time.sleep(0.5)
+            question = stt.listen(timeout=8.0)
+        
+    if question:
+        if is_main:
+            st.info(f"🎤 You asked: {question}")
+        
+        # Stop TTS again just to be sure
+        tts.interrupt()
+        tts.enqueue("Let me answer that.")
+        
+        record_event(profile, "interrupt" if is_headphones else "followup")
+        
+        if is_main:
+            with st.spinner("Answering..."):
+                answer = handle_doubt(question, board_state, cfg, profile)
+        else:
+            answer = handle_doubt(question, board_state, cfg, profile)
+            
+        adapt_profile(profile)
+        save_profile(profile)
+        
+        if is_main:
+            st.success(answer)
+        
+        speak(answer)
+        # Recursively allow voice interaction on the answer
+        _handle_voice_interaction(board_state, profile, mode)
+
 
 # ── Pipeline helpers ──────────────────────────────────────────────────────────
-def run_pipeline(frame_bgr: np.ndarray, mode: str = "math"):
+def run_pipeline(frame_bgr: np.ndarray, mode: str = "math", profile: StudentProfile | None = None):
     config = get_config()
     log = logging.getLogger("pipeline.board")
     with st.status("Running pipeline…", expanded=True) as status:
@@ -164,7 +233,7 @@ def run_pipeline(frame_bgr: np.ndarray, mode: str = "math"):
             st.write(f"📋 Topic: {board_state.topic or 'unknown'}")
             st.write("✨ AI explanation…")
             delta = detect_change(board_state, None)
-            explanation = call_gemini_api(delta, board_state, config, mode=mode)
+            explanation = call_gemini_api(delta, board_state, config, profile=profile, mode=mode)
             if explanation is None:
                 log.error("AI explanation returned None")
                 status.update(label="AI explain failed — see logs", state="error")
@@ -176,6 +245,10 @@ def run_pipeline(frame_bgr: np.ndarray, mode: str = "math"):
             status.update(label=f"Error: {exc}", state="error")
             return None, None
     return board_state, explanation
+
+
+def run_diagram_pipeline(frame_bgr: np.ndarray) -> str | None:
+    """Run diagram analysis pipeline — NIM vision free-form description."""
     config = get_config()
     log = logging.getLogger("pipeline.diagram")
     with st.status("Analysing diagram…", expanded=True) as status:
@@ -199,7 +272,7 @@ def run_pipeline(frame_bgr: np.ndarray, mode: str = "math"):
     return explanation
 
 
-def run_multi_pipeline(frames_bgr: list[np.ndarray], mode: str = "math"):
+def run_multi_pipeline(frames_bgr: list[np.ndarray], mode: str = "math", profile: StudentProfile | None = None):
     """Run the full pipeline across multiple pages/images as one coherent problem."""
     config = get_config()
     log = logging.getLogger("pipeline.multi")
@@ -237,7 +310,7 @@ def run_multi_pipeline(frames_bgr: list[np.ndarray], mode: str = "math"):
             st.write(f"📋 Topic: {board_state.topic or 'unknown'}")
             st.write("✨ AI explanation…")
             delta = detect_change(board_state, None)
-            explanation = call_gemini_api(delta, board_state, config, mode=mode)
+            explanation = call_gemini_api(delta, board_state, config, profile=profile, mode=mode)
             if explanation is None:
                 log.error("AI explanation returned None")
                 status.update(label="AI explain failed — see logs", state="error")
@@ -249,7 +322,7 @@ def run_multi_pipeline(frames_bgr: list[np.ndarray], mode: str = "math"):
             status.update(label=f"Error: {exc}", state="error")
             return None, None
     return board_state, explanation
-st.title("🎓 IntelliAgent Board Reader")
+st.title("🎓 Vision To Voice")
 st.caption("AI-powered board assistant for visually impaired students")
 
 cfg = get_config()
@@ -266,6 +339,17 @@ with st.sidebar:
         get_stt.clear()
         st.rerun()
     st.caption("Edit `config.yaml` to change.")
+    st.divider()
+
+    # ── Audio Settings ────────────────────────────────────────────────────────
+    st.subheader("🎧 Audio Settings")
+    barge_in_mode = st.radio(
+        "Audio Setup (Voice Control)",
+        ["Headphones (Interrupt AI anytime)", "Speakers (Wait for AI to finish)"],
+        index=0,
+        help="Mandatory voice control is active. If using Speakers, wait for the explanation to finish before asking a question."
+    )
+    st.session_state["barge_in_enabled"] = barge_in_mode.startswith("Headphones")
     st.divider()
 
     # ── TTS diagnostic ────────────────────────────────────────────────────────
@@ -499,6 +583,7 @@ with tab_upload:
         )
 
         if st.button(btn_label, key="btn_upload", type="primary"):
+            profile = get_profile()
             if is_diagram_mode:
                 # Diagram mode: explain first image only (NIM vision free-form)
                 explanation = run_diagram_pipeline(frames_bgr[0])
@@ -506,18 +591,19 @@ with tab_upload:
                 st.session_state["upload_board_state"] = None
                 st.session_state["upload_is_diagram"] = True
             elif n == 1:
-                board_state, explanation = run_pipeline(frames_bgr[0], explain_mode)
+                board_state, explanation = run_pipeline(frames_bgr[0], explain_mode, profile)
                 st.session_state["upload_explanation"] = explanation
                 st.session_state["upload_board_state"] = board_state
                 st.session_state["upload_is_diagram"] = False
             else:
-                board_state, explanation = run_multi_pipeline(frames_bgr, explain_mode)
+                board_state, explanation = run_multi_pipeline(frames_bgr, explain_mode, profile)
                 st.session_state["upload_explanation"] = explanation
                 st.session_state["upload_board_state"] = board_state
                 st.session_state["upload_is_diagram"] = False
             # Auto-speak as soon as explanation is ready
             if st.session_state.get("upload_explanation"):
                 speak(st.session_state["upload_explanation"])
+                _handle_voice_interaction(st.session_state.get("upload_board_state"), profile, explain_mode)
 
         # ── Persistent results (survive reruns) ───────────────────────────────
         board_state = st.session_state.get("upload_board_state")
@@ -535,94 +621,267 @@ with tab_upload:
         if explanation:
             st.subheader("🗣 Explanation")
             st.write(explanation)
-            col_speak, col_doubt = st.columns([1, 1])
-            with col_speak:
-                if st.button("🔊 Speak explanation", key="speak_upload"):
-                    speak(explanation)
-                    st.success("Speaking…")
-            with col_doubt:
-                if st.button("🎤 Ask a doubt", key="doubt_upload"):
-                    board_state_for_doubt = st.session_state.get("upload_board_state")
-                    if board_state_for_doubt is None:
-                        st.warning("No board context yet — run the pipeline first.")
-                    else:
-                        get_tts().pause()
-                        with st.spinner("Listening… speak your question now"):
-                            question = get_stt().listen(timeout=8.0)
-                        get_tts().resume()
-                        if question:
-                            st.info(f"You asked: {question}")
-                            profile = get_profile()
-                            # Detect repeat request
-                            if any(w in question.lower() for w in ["repeat", "say again", "again"]):
-                                record_event(profile, "repeat")
-                            else:
-                                record_event(profile, "followup")
-                            record_event(profile, "interrupt")
-                            with st.spinner("Answering…"):
-                                answer = handle_doubt(question, board_state_for_doubt, get_config(), profile)
-                            adapt_profile(profile)
-                            st.success(answer)
-                            speak(answer)
-                            st.session_state["upload_doubt_answer"] = answer
-                        else:
-                            st.warning("Didn't catch that — try again.")
-                            get_tts().resume()
+            if st.button("🔊 Repeat explanation", key="speak_upload"):
+                speak(explanation)
+                st.success("Speaking…")
+                _handle_voice_interaction(board_state, profile, explain_mode)
 
-            # Show last doubt answer persistently
-            if st.session_state.get("upload_doubt_answer"):
-                with st.expander("💬 Last doubt answer", expanded=False):
-                    st.write(st.session_state["upload_doubt_answer"])
 
 # ── Tab 2: Camera ─────────────────────────────────────────────────────────────
 with tab_camera:
     st.subheader("Live camera capture")
 
-    if "cam_running" not in st.session_state:
-        st.session_state.cam_running = False
-    if "cam_frame" not in st.session_state:
-        st.session_state.cam_frame = None
+    @st.cache_resource
+    def get_cam_state():
+        return {
+            "cam_running":        False,
+            "live_mode_active":   False,
+            "latest_frame":       None,
+            "ai_running":         False,
+            "last_explanation":   "",
+            "voice_trigger":      False,
+            "voice_active":       False,
+            "board_state":        None,
+            "processed_frames":   0,
+            "frame_timestamp":    0.0
+        }
 
-    col_btn1, col_btn2 = st.columns(2)
-    with col_btn1:
-        if st.button("🟢 Turn Camera ON", disabled=st.session_state.cam_running):
-            st.session_state.cam_running = True
-            st.rerun()
-    with col_btn2:
-        if st.button("🔴 Turn Camera OFF", disabled=not st.session_state.cam_running):
-            st.session_state.cam_running = False
-            st.session_state.cam_frame = None
-            st.rerun()
+    cam_state = get_cam_state()
+    from board_reader.capture import compute_frame_diff
+
+    # ── Thread 1: Pure capture ───────────────────────
+    def _capture_thread(cam_state: dict, camera_index: int):
+        import time
+        cap = cv2.VideoCapture(camera_index)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # minimize iVCam internal buffer
+        if not cap.isOpened():
+            logging.getLogger("live").error("Cannot open camera")
+            cam_state["cam_running"] = False
+            return
+        
+        for _ in range(3): # warmup
+            cap.read()
+            
+        while cam_state["cam_running"]:
+            ret, frame = cap.read()
+            if ret:
+                cam_state["latest_frame"] = frame
+                cam_state["frame_timestamp"] = time.time()
+        cap.release()
+        logging.getLogger("live").info("Capture thread exited")
+
+    def _is_sharp_enough(frame, threshold=100.0):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return cv2.Laplacian(gray, cv2.CV_64F).var() > threshold
+
+    def _get_fresh_frame(cam_state, settle_ms=500):
+        import time
+        deadline = time.time() + 2.0
+        last_seen = cam_state.get("frame_timestamp", 0)
+        while time.time() < deadline:
+            current_ts = cam_state.get("frame_timestamp", 0)
+            if current_ts > last_seen + (settle_ms / 1000.0):
+                return cam_state.get("latest_frame")
+            time.sleep(0.05)
+        return cam_state.get("latest_frame")
+
+    # ── Thread 2: AI pipeline ────────────────────────
+    def _ai_thread(cam_state: dict, capture_interval: float):
+        import time
+        prev_frame = None
+        while cam_state["cam_running"]:
+            if not cam_state["live_mode_active"]:
+                time.sleep(0.1)
+                continue
+
+            snapshot = _get_fresh_frame(cam_state, settle_ms=500)
+
+            if snapshot is None:
+                time.sleep(1)
+                continue
+
+            if prev_frame is not None:
+                diff = compute_frame_diff(snapshot, prev_frame)
+                if diff < cfg.change_threshold:
+                    time.sleep(2)       # nothing changed
+                    continue
+
+            if not _is_sharp_enough(snapshot):
+                time.sleep(1)
+                continue  # skip blurry frame
+
+            prev_frame = snapshot.copy()
+            cam_state["ai_running"] = True
+
+            try:
+                profile = get_profile()
+                preprocessed = preprocess(snapshot)
+                plain = extract_text(preprocessed)
+                latex = extract_latex(preprocessed)
+                ocr_text = combine_ocr(plain, latex)
+                
+                board_state = call_nim(preprocessed, ocr_text, cfg)
+                
+                if board_state is not None:
+                    previous_board = cam_state.get("board_state")
+                    delta = detect_change(board_state, previous_board)
+                    
+                    if delta is not None:
+                        explanation = call_gemini_api(delta, board_state, cfg, profile=profile, mode="math")
+                        
+                        if explanation:
+                            cam_state["last_explanation"] = explanation
+                            cam_state["board_state"] = board_state
+                            cam_state["processed_frames"] += 1
+                            record_event(profile, "explanation")
+                            cam_state["voice_trigger"] = True
+            except Exception as e:
+                logging.getLogger("live").error("AI pipeline error: %s", e, exc_info=True)
+            finally:
+                cam_state["ai_running"] = False
+
+            time.sleep(capture_interval)
+
+    # ── Thread 3: Voice ──────────────────────────────
+    def _voice_thread(cam_state: dict):
+        import time
+        while cam_state["cam_running"]:
+            if not cam_state.get("voice_trigger"):
+                time.sleep(0.2)
+                continue
+
+            cam_state["voice_trigger"] = False
+            cam_state["voice_active"] = True
+            try:
+                speak(cam_state["last_explanation"])
+                profile = get_profile()
+                _handle_voice_interaction(cam_state["board_state"], profile, "math")
+            except Exception as e:
+                logging.getLogger("live").error("Voice thread error: %s", e, exc_info=True)
+            finally:
+                cam_state["voice_active"] = False
+
+    # ── Thread launcher ──────────────────────────────
+    def ensure_threads_running(cam_state: dict, camera_index: int):
+        import threading
+        threads = cam_state.setdefault("_threads", [])
+        alive = [t for t in threads if t.is_alive()]
+        cam_state["_threads"] = alive
+
+        if len(alive) == 3:
+            return
+
+        targets = [
+            ("capture", _capture_thread, (cam_state, camera_index)),
+            ("ai",      _ai_thread,      (cam_state, cfg.capture_interval)),
+            ("voice",   _voice_thread,   (cam_state,)),
+        ]
+        alive_names = {t.name for t in alive}
+        for name, fn, args in targets:
+            if name not in alive_names:
+                t = threading.Thread(target=fn, args=args, name=name, daemon=True)
+                t.start()
+                cam_state["_threads"].append(t)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if not cam_state["cam_running"]:
+            if st.button("🟢 Turn Camera ON"):
+                cam_state["cam_running"] = True
+                ensure_threads_running(cam_state, cfg.camera_index)
+                st.rerun()
+        else:
+            if st.button("🔴 Turn Camera OFF"):
+                cam_state["cam_running"] = False
+                cam_state["live_mode_active"] = False
+                st.rerun()
+
+    with col2:
+        if cam_state["cam_running"]:
+            if not cam_state["live_mode_active"]:
+                if st.button("▶ Start Live Mode", type="primary"):
+                    cam_state["live_mode_active"] = True
+                    st.rerun()
+            else:
+                if st.button("⏹ Stop Live Mode", type="secondary"):
+                    cam_state["live_mode_active"] = False
+                    st.rerun()
+        else:
+            st.info("Click 'Turn Camera ON' first.")
+
+    # ── Status indicators ─────────────────────────────────────────────────────
+    status_cols = st.columns(3)
+    with status_cols[0]:
+        st.caption("🟢 Camera live" if cam_state["cam_running"] else "⚫ Camera off")
+    with status_cols[1]:
+        st.caption("🔵 AI running..." if cam_state["ai_running"] else "⚪ AI idle")
+    with status_cols[2]:
+        st.caption("🎙️ Listening..." if cam_state["voice_active"] else "⚪ Voice idle")
+
+    if cam_state["live_mode_active"]:
+        st.success(f"🔴 LIVE - Monitoring camera (processed {cam_state['processed_frames']} changes)")
 
     cam_placeholder = st.empty()
 
-    if st.session_state.cam_running:
-        cap = cv2.VideoCapture(cfg.camera_index)
-        if not cap.isOpened():
-            logging.getLogger("camera").error("Could not open camera index %d", cfg.camera_index)
-            st.error(f"Could not open camera index {cfg.camera_index}. Check config.yaml.")
-            st.session_state.cam_running = False
-        else:
-            st.info("Camera is ON — click Capture & Explain to process the current frame.")
-            ret, frame = cap.read()
-            cap.release()
-            if ret and frame is not None:
-                st.session_state.cam_frame = frame
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                cam_placeholder.image(rgb, caption="Live preview", use_container_width=True)
+    if cam_state["cam_running"]:
+        import base64
+        def frame_to_base64(frame):
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            return base64.b64encode(buffer).decode('utf-8')
 
+        @st.fragment(run_every=0.1)
+        def _video_feed():
+            # Trigger full UI update when a new board state is fully processed
+            current_processed = cam_state.get("processed_frames", 0)
+            if "last_processed" not in st.session_state:
+                st.session_state.last_processed = current_processed
+            
+            if current_processed > st.session_state.last_processed:
+                st.session_state.last_processed = current_processed
+                st.rerun()
+
+            frame = cam_state.get("latest_frame")
+            if frame is not None:
+                b64 = frame_to_base64(frame)
+                if cam_state.get("ai_running"):
+                    html = f'''
+                    <div style="position:relative; width:100%; aspect-ratio:16/9; border-radius:8px; overflow:hidden;">
+                        <img src="data:image/jpeg;base64,{b64}" style="width:100%; height:100%; object-fit:cover; opacity:0.6;">
+                        <div style="position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); 
+                                    background:rgba(0,0,0,0.8); color:white; padding:15px 25px; border-radius:10px; 
+                                    font-size:20px; font-weight:bold; font-family:sans-serif; text-align:center;
+                                    box-shadow: 0 4px 6px rgba(0,0,0,0.3); z-index:10;">
+                            ⏳ AI Processing Board...
+                        </div>
+                    </div>
+                    '''
+                else:
+                    html = f'''
+                    <div style="position:relative; width:100%; aspect-ratio:16/9; border-radius:8px; overflow:hidden;">
+                        <img src="data:image/jpeg;base64,{b64}" style="width:100%; height:100%; object-fit:cover;">
+                    </div>
+                    '''
+                cam_placeholder.html(html)
+            else:
+                cam_placeholder.info("Camera is warming up...")
+                
+        _video_feed()
+        
+        if not cam_state["live_mode_active"]:
             if st.button("📸 Capture & Explain", type="primary", key="btn_cam"):
-                if st.session_state.cam_frame is not None:
-                    board_state, explanation = run_pipeline(st.session_state.cam_frame)
-                    st.session_state["cam_explanation"] = explanation
-                    st.session_state["cam_board_state"] = board_state
-                    # Auto-speak as soon as explanation is ready
+                if cam_state["latest_frame"] is not None:
+                    profile = get_profile()
+                    board_state, explanation = run_pipeline(cam_state["latest_frame"], "math", profile)
+                    cam_state["last_explanation"] = explanation
+                    cam_state["board_state"] = board_state
+
                     if explanation:
                         speak(explanation)
+                        record_event(profile, "explanation")
+                        _handle_voice_interaction(board_state, profile, "math")
 
-        # ── Persistent camera results ─────────────────────────────────────────
-        cam_board = st.session_state.get("cam_board_state")
-        cam_explanation = st.session_state.get("cam_explanation")
+        cam_board = cam_state.get("board_state")
+        cam_explanation = cam_state.get("last_explanation")
 
         if cam_board:
             with st.expander("📋 Parsed board content", expanded=False):
@@ -635,36 +894,28 @@ with tab_camera:
         if cam_explanation:
             st.subheader("🗣 Explanation")
             st.write(cam_explanation)
-            col_speak_cam, col_doubt_cam = st.columns([1, 1])
+            col_speak_cam, col_feedback = st.columns([1, 1])
             with col_speak_cam:
-                if st.button("🔊 Speak explanation", key="speak_cam"):
+                if st.button("🔊 Repeat explanation", key="speak_cam"):
                     speak(cam_explanation)
                     st.success("Speaking…")
-            with col_doubt_cam:
-                if st.button("🎤 Ask a doubt", key="doubt_cam"):
-                    cam_board_for_doubt = st.session_state.get("cam_board_state")
-                    if cam_board_for_doubt is None:
-                        st.warning("No board context yet — capture a frame first.")
-                    else:
-                        get_tts().pause()
-                        with st.spinner("Listening… speak your question now"):
-                            question = get_stt().listen(timeout=8.0)
-                        get_tts().resume()
-                        if question:
-                            st.info(f"You asked: {question}")
-                            profile = get_profile()
-                            if any(w in question.lower() for w in ["repeat", "say again", "again"]):
-                                record_event(profile, "repeat")
-                            else:
-                                record_event(profile, "followup")
-                            record_event(profile, "interrupt")
-                            with st.spinner("Answering…"):
-                                answer = handle_doubt(question, cam_board_for_doubt, get_config(), profile)
-                            adapt_profile(profile)
-                            st.success(answer)
-                            speak(answer)
-                        else:
-                            st.warning("Didn't catch that — try again.")
-                            get_tts().resume()
+                    profile = get_profile()
+                    _handle_voice_interaction(cam_board, profile, "math")
+
+            with col_feedback:
+                st.caption("Was this helpful?")
+                col_yes, col_no = st.columns(2)
+                with col_yes:
+                    if st.button("✅ Yes", key="feedback_yes"):
+                        profile = get_profile()
+                        record_event(profile, "explanation")
+                        st.success("Thanks!")
+                with col_no:
+                    if st.button("❌ Confused", key="feedback_no"):
+                        profile = get_profile()
+                        record_event(profile, "interrupt")
+                        adapt_profile(profile)
+                        save_profile(profile)
+                        st.warning("I'll simplify the next explanation.")
     else:
         cam_placeholder.info("Camera is OFF. Click Turn Camera ON to start.")

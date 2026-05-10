@@ -15,9 +15,16 @@ def capture_frame(camera_index: int) -> np.ndarray | None:
     or the read fails.
     """
     cap = cv2.VideoCapture(camera_index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    
     if not cap.isOpened():
         logger.error("Camera index %d could not be opened.", camera_index)
         return None
+
+    # Warm up camera
+    for _ in range(3):
+        cap.read()
 
     ret, frame = cap.read()
     cap.release()
@@ -56,21 +63,30 @@ def preprocess(frame: np.ndarray) -> np.ndarray:
 
     Steps:
       1. BGR → grayscale
-      2. Gaussian blur (noise reduction)
+      2. Denoise
       3. CLAHE (contrast enhancement)
-      4. Auto-invert if background is dark (white-on-black → black-on-white)
-         PaddleOCR v2 expects dark text on light background.
-      5. Convert back to BGR (3-channel) — required by PaddleOCR and NIM vision
-
-    Returns a 3-channel uint8 BGR ndarray of the same spatial dimensions.
+      4. Auto-invert if background is dark (chalk board)
+      5. Morphology ops (sharpening)
+      6. Convert back to BGR (3-channel)
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Denoise
+    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+
+    # CLAHE — adaptive contrast for board text
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(blurred)
-    # If the median pixel is dark, the background is dark — invert so text is dark on light
-    if np.median(enhanced) < 127:
-        enhanced = cv2.bitwise_not(enhanced)
+    enhanced = clahe.apply(denoised)
+
+    # Auto-invert if background is darker than text (chalk board)
+    mean_val = cv2.mean(enhanced)[0]
+    if mean_val < 120:  # dark background
+        enhanced = 255 - enhanced
         logger.debug("preprocess: dark background detected, image inverted")
+
+    # Slight sharpening
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    sharpened = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
+
     # Convert back to 3-channel BGR so PaddleOCR and vision models work correctly
-    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
