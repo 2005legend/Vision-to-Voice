@@ -177,16 +177,15 @@ def _handle_voice_interaction(board_state, profile, mode="math"):
 
     stt = get_stt()
     tts = get_tts()
-    cfg = get_config()
     cam_state = get_cam_state()
     is_headphones = cam_state.get("barge_in_enabled", True)
 
     if not is_headphones:
-        # Wait for TTS queue to fully drain
+        # Speaker mode: wait for TTS to fully finish, then listen once
         deadline = time.time() + 120.0
         while time.time() < deadline:
             if tts._queue.empty() and tts._current_proc is None:
-                time.sleep(0.3)  # small gap so last word finishes
+                time.sleep(0.4)  # gap so last word finishes
                 break
             time.sleep(0.2)
         question = stt.listen(timeout=8.0)
@@ -195,22 +194,15 @@ def _handle_voice_interaction(board_state, profile, mode="math"):
             _dispatch_voice_command(question, board_state, profile, mode)
         return
 
-    # Headphone mode: listen while TTS speaks
-    # Wait until TTS worker actually starts processing (proc becomes non-None)
-    import time as _time
-    deadline = _time.time() + 3.0
-    while _time.time() < deadline:
-        if tts._current_proc is not None or not tts._queue.empty():
-            break
-        _time.sleep(0.05)
-    # Small extra gap so first word starts playing
-    _time.sleep(0.2)
-
+    # Headphone mode: start listening immediately, concurrently with TTS
+    # Don't wait for proc — TTS may take a moment to start, listener runs in parallel
     speech_detected = threading.Event()
     question_holder = [None]
 
     def _listen_worker():
-        q = stt.listen(timeout=30.0)
+        # Brief delay so mic doesn't catch the very first TTS word
+        time.sleep(0.4)
+        q = stt.listen(timeout=45.0)  # long timeout — student may speak anytime
         if q:
             question_holder[0] = q
             speech_detected.set()
@@ -218,20 +210,15 @@ def _handle_voice_interaction(board_state, profile, mode="math"):
     listener = threading.Thread(target=_listen_worker, daemon=True, name="stt-concurrent")
     listener.start()
 
-    # Wait until student speaks OR TTS finishes naturally
+    # Poll until: student spoke OR TTS fully finished (queue empty + no active proc)
     while not speech_detected.is_set():
-        queue_empty = tts._queue.empty()
-        proc_done = tts._current_proc is None
-        if queue_empty and proc_done:
-            # TTS finished — give listener 2 more seconds to catch trailing speech
-            speech_detected.wait(timeout=2.0)
+        if tts._queue.empty() and tts._current_proc is None:
+            # TTS done — wait a little longer for trailing speech
+            speech_detected.wait(timeout=3.0)
             break
-        time.sleep(0.1)
+        time.sleep(0.15)
 
     question = question_holder[0]
-    if question:
-        tts.interrupt()
-        _dispatch_voice_command(question, board_state, profile, mode)
     if question:
         tts.interrupt()
         _dispatch_voice_command(question, board_state, profile, mode)
