@@ -866,30 +866,67 @@ with tab_camera:
 
     # ── Thread 3: Always-on voice loop ──────────────────────────────
     def _voice_thread(cam_state: dict):
-        """Always-on voice loop.
+        """Always-on voice loop with non-blocking state machine.
 
-        States:
-          - Idle (no explanation playing): listens for commands every cycle
-          - Speaking: listens concurrently (headphone) or after (speaker)
-          - After answer: keeps listening for follow-ups
+        Uses a short STT timeout (2s) so the loop checks triggers every 2s max.
+        State: IDLE → SPEAKING → LISTENING → IDLE
         """
         import time
+        import threading
         log = logging.getLogger("voice")
 
         # Announce readiness once
-        time.sleep(2.0)  # wait for TTS engine to start
-        speak("Vision to Voice is ready. Say 'camera on' to start, or 'help' for commands.")
+        time.sleep(2.0)
+        speak("Vision to Voice is ready. Say camera on to start, or say help for commands.")
+
+        # Persistent idle listener thread — runs separately so voice_trigger
+        # can be processed immediately without waiting for STT to time out
+        idle_q = [None]          # holds last heard idle command
+        idle_listening = [False] # True while idle listener is active
+
+        def _idle_listener():
+            while cam_state["cam_running"]:
+                # Only listen when voice thread is truly idle
+                if (not cam_state.get("voice_active")
+                        and not cam_state.get("voice_trigger")
+                        and not cam_state.get("manual_capture_trigger")):
+                    idle_listening[0] = True
+                    try:
+                        q = get_stt().listen(timeout=3.0)
+                        if q:
+                            idle_q[0] = q
+                    except Exception:
+                        pass
+                    finally:
+                        idle_listening[0] = False
+                else:
+                    time.sleep(0.2)
+
+        idle_t = threading.Thread(target=_idle_listener, daemon=True, name="stt-idle")
+        idle_t.start()
 
         while cam_state["cam_running"]:
 
-            # ── Handle manual capture trigger from voice command ──
+            # ── Process idle voice command ──────────────────────
+            if idle_q[0] and not cam_state.get("voice_active"):
+                q = idle_q[0]
+                idle_q[0] = None
+                board_state = cam_state.get("board_state")
+                profile = get_profile()
+                _dispatch_voice_command(q, board_state, profile, "math")
+                time.sleep(0.1)
+                continue
+
+            # ── Manual capture trigger ───────────────────────────
             if cam_state.get("manual_capture_trigger"):
                 cam_state["manual_capture_trigger"] = False
-                if cam_state.get("latest_frame") is not None:
-                    cam_state["voice_active"] = True
-                    try:
+                cam_state["voice_active"] = True
+                try:
+                    if cam_state.get("latest_frame") is not None:
                         profile = get_profile()
-                        board_state, explanation = _run_pipeline_bg(cam_state["latest_frame"], "math", profile)
+                        board_state, explanation = _run_pipeline_bg(
+                            cam_state["latest_frame"], "math", profile
+                        )
                         if explanation:
                             cam_state["last_explanation"] = explanation
                             cam_state["board_state"] = board_state
@@ -897,16 +934,18 @@ with tab_camera:
                             record_event(profile, "explanation")
                             speak(explanation)
                             _handle_voice_interaction(board_state, profile, "math")
-                    except Exception as e:
-                        log.error("Manual capture error: %s", e, exc_info=True)
-                        speak("Sorry, capture failed.")
-                    finally:
-                        cam_state["voice_active"] = False
-                else:
-                    speak("Camera is not ready yet.")
+                        else:
+                            speak("Sorry, I couldn't read the board.")
+                    else:
+                        speak("Camera is not ready yet.")
+                except Exception as e:
+                    log.error("Manual capture error: %s", e, exc_info=True)
+                    speak("Sorry, capture failed.")
+                finally:
+                    cam_state["voice_active"] = False
                 continue
 
-            # ── Handle camera on trigger from voice command ──
+            # ── Camera on trigger ────────────────────────────────
             if cam_state.get("camera_on_trigger"):
                 cam_state["camera_on_trigger"] = False
                 if not cam_state["cam_running"]:
@@ -914,7 +953,7 @@ with tab_camera:
                     ensure_threads_running(cam_state, cfg.camera_index)
                 continue
 
-            # ── Handle AI pipeline voice trigger ──
+            # ── AI pipeline voice trigger ────────────────────────
             if cam_state.get("voice_trigger"):
                 cam_state["voice_trigger"] = False
                 cam_state["voice_active"] = True
@@ -930,22 +969,7 @@ with tab_camera:
                     cam_state["voice_active"] = False
                 continue
 
-            # ── Idle: always listen for commands ──
-            # Even when nothing is happening, student can say "capture", "repeat", etc.
-            if not cam_state.get("voice_active"):
-                cam_state["voice_active"] = True
-                try:
-                    q = get_stt().listen(timeout=5.0)
-                    if q:
-                        board_state = cam_state.get("board_state")
-                        profile = get_profile()
-                        _dispatch_voice_command(q, board_state, profile, "math")
-                except Exception as e:
-                    log.error("Idle listen error: %s", e, exc_info=True)
-                finally:
-                    cam_state["voice_active"] = False
-
-            time.sleep(0.1)
+            time.sleep(0.05)  # tight loop — checks triggers every 50ms
 
     # ── Thread launcher ──────────────────────────────
     def ensure_threads_running(cam_state: dict, camera_index: int):
